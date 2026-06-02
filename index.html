@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#f7f1e3">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="ふしぎノート">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <title>ふしぎノート</title>
+    <link rel="manifest" href="./manifest.webmanifest">
+    <link rel="apple-touch-icon" href="./assets/icon.svg">
+    <link rel="icon" href="./assets/icon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <button class="icon-button" id="backButton" type="button" aria-label="もどる" hidden>
+          <span aria-hidden="true">←</span>
+        </button>
+        <div>
+          <p class="eyebrow">5ふんの けんきゅう</p>
+          <h1>ふしぎノート</h1>
+        </div>
+        <button class="icon-button" id="settingsButton" type="button" aria-label="おとな設定">
+          <span aria-hidden="true">⚙</span>
+        </button>
+      </header>
+
+      <main id="app" tabindex="-1"></main>
+
+      <nav class="bottom-nav" aria-label="アプリメニュー">
+        <button type="button" data-nav="home" class="nav-item is-active">
+          <span aria-hidden="true">⌂</span>
+          <span>ホーム</span>
+        </button>
+        <button type="button" data-nav="themes" class="nav-item">
+          <span aria-hidden="true">□</span>
+          <span>テーマ</span>
+        </button>
+        <button type="button" data-nav="gallery" class="nav-item">
+          <span aria-hidden="true">▣</span>
+          <span>ずかん</span>
+        </button>
+      </nav>
+    </div>
+
+    <template id="summaryTemplate">
+      <article class="entry-card">
+        <div class="entry-card__media"></div>
+        <div class="entry-card__body"></div>
+      </article>
+    </template>
+
+    <script src="./app.js" defer></script>
+  </body>
+</html>
