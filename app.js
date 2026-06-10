@@ -241,6 +241,7 @@ let recordingSeconds = 0;
 
 render();
 registerServiceWorker();
+initSync();
 
 // ============================================================
 // グローバルナビ
@@ -355,6 +356,7 @@ function loadStore() {
 
 function saveStore() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+  scheduleRemotePush();
 }
 
 function normalizeCustomTheme(custom = {}) {
@@ -1538,6 +1540,7 @@ function renderSettings() {
           }),
           renderSettingsQuickButton("📧", "メール送り先", (store.mailRecipients || []).length ? `${store.mailRecipients.length}件` : "未設定", setMailRecipients),
           renderSettingsQuickButton("🔒", "PIN", store.parentMode?.pin ? "設定済み" : "未設定", setParentPin),
+          renderSettingsQuickButton("☁", "クラウド同期", syncStatusLabel(), openSyncSettings),
           renderSettingsQuickButton("🚪", "ロックして もどる", "", lockParentMode),
         ]),
         el("div", { className: "button-row" }, [
@@ -3093,6 +3096,188 @@ function toast(message) {
   const node = el("div", { className: "toast", role: "status" }, message);
   document.body.append(node);
   window.setTimeout(() => node.remove(), 1700);
+}
+
+// ============================================================
+// クラウド同期（Firebase Realtime Database）
+// ------------------------------------------------------------
+// 方式: 追加マージ同期。Mac ↔ iPad で entries / customThemes /
+//   themeOverrides / ideasBox / dailyWonders / starred を union し、
+//   「足したもの」が双方に数秒で反映される（共創ループ用）。
+//   合言葉(FAMILY_KEY)を SHA-256 したパスにだけ読み書きする。
+//
+// ※ 既存の「バックアップ＝マージ」と同じ意味論：追加は同期するが、
+//    既存項目の編集・削除は端末ごと（削除は次回同期で復活しうる）。
+//    PIN・メール送り先・選択中テーマは端末ごと（同期しない）。
+// ============================================================
+const FAMILY_KEY = "fushigi-sync-family";
+let syncRef = null;
+let syncEnabled = false;
+let syncStatusText = "";
+let pushTimer = null;
+let lastSyncedSig = null;
+
+function syncConfigured() {
+  const cfg = window.FUSHIGI_FIREBASE_CONFIG;
+  return !!(
+    cfg &&
+    cfg.apiKey &&
+    !String(cfg.apiKey).startsWith("PASTE") &&
+    cfg.databaseURL &&
+    !String(cfg.databaseURL).includes("PASTE") &&
+    typeof firebase !== "undefined"
+  );
+}
+
+function getFamilyCode() {
+  try {
+    return localStorage.getItem(FAMILY_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+// 同期する範囲（端末ローカルな値は含めない）
+function syncSubset(s) {
+  return {
+    entries: s.entries || [],
+    customThemes: s.customThemes || [],
+    themeOverrides: s.themeOverrides || {},
+    ideasBox: s.ideasBox || [],
+    dailyWonders: s.dailyWonders || [],
+    starred: s.starred || {},
+  };
+}
+
+// 並び順に依存しない署名（push ループ防止＝収束させるため）
+function syncSig(s) {
+  const ids = (arr) => (arr || []).map((x) => x && x.id).filter(Boolean).sort().join(",");
+  return [
+    ids(s.entries),
+    ids(s.customThemes),
+    ids(s.ideasBox),
+    ids(s.dailyWonders),
+    Object.keys(s.themeOverrides || {}).sort().join(","),
+    Object.keys(s.starred || {}).filter((k) => s.starred[k]).sort().join(","),
+  ].join("|");
+}
+
+async function familyPath(code) {
+  const data = new TextEncoder().encode("fushigi-note::" + code);
+  const buf = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+    .slice(0, 40);
+}
+
+async function initSync() {
+  if (!syncConfigured()) {
+    syncStatusText = "鍵 未設定";
+    return;
+  }
+  const code = getFamilyCode();
+  if (!code) {
+    syncStatusText = "合言葉 未設定";
+    return;
+  }
+  try {
+    if (!firebase.apps.length) firebase.initializeApp(window.FUSHIGI_FIREBASE_CONFIG);
+    await firebase.auth().signInAnonymously();
+    if (syncRef) {
+      try {
+        syncRef.off();
+      } catch {}
+    }
+    const path = await familyPath(code);
+    syncRef = firebase.database().ref("families/" + path + "/store");
+    syncRef.on("value", (snap) => onRemote(snap.val()));
+    syncEnabled = true;
+    syncStatusText = "オン";
+    scheduleRemotePush(); // 自分の今の状態をクラウドへ（初回シード）
+  } catch (error) {
+    console.warn("クラウド同期に つながりませんでした", error);
+    syncEnabled = false;
+    syncStatusText = "つながらず";
+  }
+}
+
+function onRemote(val) {
+  if (!val) return;
+  let data;
+  try {
+    data = JSON.parse(val);
+  } catch {
+    return;
+  }
+  if (!data || !Array.isArray(data.entries)) return;
+  const before = syncSig(store);
+  mergeBackup(data); // union。saveStore() 経由で scheduleRemotePush も走る
+  if (syncSig(store) !== before) {
+    render();
+  }
+}
+
+function scheduleRemotePush() {
+  if (!syncEnabled || !syncRef) return;
+  clearTimeout(pushTimer);
+  pushTimer = window.setTimeout(() => {
+    const sig = syncSig(store);
+    if (sig === lastSyncedSig) return; // 変化なし＝送らない（収束）
+    lastSyncedSig = sig;
+    syncRef
+      .set(JSON.stringify(syncSubset(store)))
+      .catch((error) => console.warn("クラウドへの保存に 失敗", error));
+  }, 700);
+}
+
+function syncStatusLabel() {
+  if (!syncConfigured()) return "鍵 未設定";
+  if (!getFamilyCode()) return "合言葉 未設定";
+  return syncEnabled ? "オン" : syncStatusText || "接続中";
+}
+
+function openSyncSettings() {
+  if (!syncConfigured()) {
+    alert(
+      "クラウド同期の じゅんびが まだです。\n\n" +
+        "firebase-config.js に Firebase の せっていを はりつけてください。\n" +
+        "くわしい てじゅんは SYNC_SETUP.md を 見てね。"
+    );
+    return;
+  }
+  const cur = getFamilyCode();
+  const code = window.prompt(
+    "家族の あいことば を 入れてください。\n" +
+      "Mac と iPad で 同じ ことばを 入れると、内容が 同期します。\n\n" +
+      "（れい: nagi-kazoku-2026）\n\n" +
+      "空にして OK を おすと 同期を オフにします。",
+    cur
+  );
+  if (code === null) return;
+  const trimmed = code.trim();
+  if (!trimmed) {
+    try {
+      localStorage.removeItem(FAMILY_KEY);
+    } catch {}
+    if (syncRef) {
+      try {
+        syncRef.off();
+      } catch {}
+      syncRef = null;
+    }
+    syncEnabled = false;
+    syncStatusText = "オフ";
+    toast("同期を オフにしました");
+    render();
+    return;
+  }
+  try {
+    localStorage.setItem(FAMILY_KEY, trimmed);
+  } catch {}
+  toast("あいことば を ほぞん。つなぎます…");
+  lastSyncedSig = null;
+  initSync().then(() => render());
 }
 
 function registerServiceWorker() {
