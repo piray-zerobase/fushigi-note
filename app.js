@@ -2676,6 +2676,7 @@ function exportThemeAsJson(theme) {
 
 function openJsonImportPrompt() {
   const sample = `{
+  "id": "hikari-2026-06",
   "icon": "🌱",
   "title": "5/19 たねの教室",
   "question": "たねの なかには なにが ある？",
@@ -2687,7 +2688,10 @@ function openJsonImportPrompt() {
       "steps": ["みずに つけよう","1日 まってみよう","どうなった？"] }
   ]
 }`;
-  const raw = window.prompt("テーマJSONを はりつけて OK を 押してください。", sample);
+  const raw = window.prompt(
+    "テーマJSONを はりつけて OK を 押してください。\n（同じ id なら 上書き更新／id が なければ 新規追加）",
+    sample
+  );
   if (!raw) return;
   try {
     const data = JSON.parse(raw);
@@ -2695,9 +2699,16 @@ function openJsonImportPrompt() {
     if (!normalized.missions || !normalized.missions.length) {
       normalized.missions = generateMissions(normalized).map(normalizeMission);
     }
-    store.customThemes = [normalized, ...store.customThemes];
+    // 同じ id が あれば その場で 置き換え（重複させない）。なければ 先頭に 追加。
+    const existingIndex = store.customThemes.findIndex((t) => t.id === normalized.id);
+    const isUpdate = existingIndex !== -1;
+    if (isUpdate) {
+      store.customThemes = store.customThemes.map((t, i) => (i === existingIndex ? normalized : t));
+    } else {
+      store.customThemes = [normalized, ...store.customThemes];
+    }
     saveStore();
-    toast(`「${normalized.title}」を 追加しました`);
+    toast(isUpdate ? `「${normalized.title}」を 更新しました` : `「${normalized.title}」を 追加しました`);
     startEditing(normalized.id); // open editor to review
   } catch (e) {
     alert(`JSONを 読めませんでした。\n${e.message}`);

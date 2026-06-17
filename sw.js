@@ -1,4 +1,4 @@
-const CACHE_NAME = "fushigi-note-v9";
+const CACHE_NAME = "fushigi-note-v10";
 const ASSETS = [
   "./",
   "./index.html",
