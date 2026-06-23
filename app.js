@@ -241,6 +241,7 @@ let recordingSeconds = 0;
 
 render();
 registerServiceWorker();
+initFirebaseSync();
 
 // ============================================================
 // グローバルナビ
@@ -355,6 +356,7 @@ function loadStore() {
 
 function saveStore() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+  schedulePublish();
 }
 
 function normalizeCustomTheme(custom = {}) {
@@ -1538,6 +1540,7 @@ function renderSettings() {
           }),
           renderSettingsQuickButton("📧", "メール送り先", (store.mailRecipients || []).length ? `${store.mailRecipients.length}件` : "未設定", setMailRecipients),
           renderSettingsQuickButton("🔒", "PIN", store.parentMode?.pin ? "設定済み" : "未設定", setParentPin),
+          renderSettingsQuickButton("☁", "クラウド同期", syncStatusLabel(), openSyncSettings),
           renderSettingsQuickButton("🚪", "ロックして もどる", "", lockParentMode),
         ]),
         el("div", { className: "button-row" }, [
@@ -3104,6 +3107,199 @@ function toast(message) {
   const node = el("div", { className: "toast", role: "status" }, message);
   document.body.append(node);
   window.setTimeout(() => node.remove(), 1700);
+}
+
+// ============================================================
+// クラウド自動同期（Firebase Realtime Database）
+// ------------------------------------------------------------
+// 設計（設計書_Firebase自動同期.md）:
+//   ・一方向：配信端末(PC)が教材を書き、受信端末(子)が受け取る。
+//   ・配信端末＝publish のみ／受信端末＝subscribe のみ（競合なし）。
+//   ・同期するのは「教材」だけ（selectedThemeId / customThemes /
+//     themeOverrides / dailyWonders）。子の成果(entries/starred/
+//     ideasBox/PIN)はFirebaseに乗せない・上書きしない。
+//   ・合言葉を SHA-256 したパスにだけ読み書き（鍵はコードに書かない）。
+// ============================================================
+const FAMILY_CODE_KEY = "fushigi-family-code";
+const SYNC_ROLE_KEY = "fushigi-sync-role";
+let familyRef = null;
+let firebaseReady = false;
+let syncRole = "receiver";
+let lastSyncRaw = null;
+let pubTimer = null;
+
+function firebaseConfigured() {
+  const c = window.FUSHIGI_FIREBASE_CONFIG;
+  return !!(
+    c &&
+    c.apiKey &&
+    !String(c.apiKey).startsWith("PASTE") &&
+    c.databaseURL &&
+    !String(c.databaseURL).includes("PASTE") &&
+    typeof firebase !== "undefined"
+  );
+}
+
+function getFamilyCode() {
+  try {
+    return localStorage.getItem(FAMILY_CODE_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+function getSyncRole() {
+  try {
+    return localStorage.getItem(SYNC_ROLE_KEY) || "receiver";
+  } catch {
+    return "receiver";
+  }
+}
+
+// 同期する範囲＝教材だけ（子の成果は含めない）
+function teachingSubset(s) {
+  return {
+    selectedThemeId: s.selectedThemeId || "plant",
+    customThemes: s.customThemes || [],
+    themeOverrides: s.themeOverrides || {},
+    dailyWonders: s.dailyWonders || [],
+  };
+}
+
+async function familyPath(code) {
+  const data = new TextEncoder().encode("fushigi-note::" + code);
+  const buf = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+    .slice(0, 40);
+}
+
+async function initFirebaseSync() {
+  if (!firebaseConfigured()) return; // 未設定 → 同期オフ（アプリは通常動作）
+  const code = getFamilyCode();
+  if (!code) return; // 合言葉未設定 → オフ
+  syncRole = getSyncRole();
+  try {
+    if (!firebase.apps.length) firebase.initializeApp(window.FUSHIGI_FIREBASE_CONFIG);
+    await firebase.auth().signInAnonymously();
+    const path = await familyPath(code);
+    if (familyRef) {
+      try {
+        familyRef.off();
+      } catch {}
+    }
+    familyRef = firebase.database().ref("families/" + path + "/content");
+    firebaseReady = true;
+    if (syncRole === "publisher") {
+      schedulePublish(); // 配信端末：今の教材をクラウドへ（初回シード）
+    } else {
+      familyRef.on("value", (snap) => onRemoteContent(snap.val())); // 受信端末：待ち受け
+    }
+  } catch (error) {
+    console.warn("Firebase同期に つながりませんでした", error);
+    firebaseReady = false;
+  }
+}
+
+// 受信端末：クラウドの教材を受け取って反映
+function onRemoteContent(raw) {
+  if (!raw || raw === lastSyncRaw) return;
+  lastSyncRaw = raw;
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return;
+  }
+  if (applyTeaching(data)) render();
+}
+
+// 教材だけ置き換える（子の成果には触れない）
+function applyTeaching(data) {
+  if (!data || typeof data !== "object") return false;
+  if (Array.isArray(data.customThemes)) {
+    store.customThemes = data.customThemes.map(normalizeCustomTheme);
+  }
+  if (data.themeOverrides && typeof data.themeOverrides === "object") {
+    store.themeOverrides = data.themeOverrides;
+  }
+  if (Array.isArray(data.dailyWonders)) {
+    store.dailyWonders = data.dailyWonders;
+  }
+  if (data.selectedThemeId) {
+    store.selectedThemeId = data.selectedThemeId;
+  }
+  saveStore(); // 受信端末では schedulePublish は role 判定で何もしない
+  return true;
+}
+
+// 配信端末：教材が変わったらクラウドへ
+function schedulePublish() {
+  if (syncRole !== "publisher" || !firebaseReady || !familyRef) return;
+  clearTimeout(pubTimer);
+  pubTimer = window.setTimeout(() => {
+    const raw = JSON.stringify(teachingSubset(store));
+    if (raw === lastSyncRaw) return; // 教材に変化なし → 送らない
+    lastSyncRaw = raw;
+    familyRef.set(raw).catch((error) => console.warn("クラウドへの保存に 失敗", error));
+  }, 600);
+}
+
+function syncStatusLabel() {
+  if (!firebaseConfigured()) return "未設定";
+  if (!getFamilyCode()) return "合言葉 未設定";
+  const role = getSyncRole() === "publisher" ? "配信" : "受信";
+  return role + (firebaseReady ? "・ON" : "…");
+}
+
+function openSyncSettings() {
+  if (!firebaseConfigured()) {
+    alert(
+      "クラウド同期の じゅんびが まだです。\n\n" +
+        "Firebaseの せっていを firebase-config.js に はりつけてください。\n" +
+        "てじゅんは 設計書_Firebase自動同期.md の「7. 実装ステップ」を 見てね。"
+    );
+    return;
+  }
+  const curCode = getFamilyCode();
+  const code = window.prompt(
+    "家族の あいことば を 入れてください。\n" +
+      "ぜんぶの 端末で 同じ ことばを 入れます。\n\n" +
+      "（れい: nagi-hikari-2026）\n\n" +
+      "空にして OK を おすと 同期を オフにします。",
+    curCode
+  );
+  if (code === null) return;
+  const trimmed = code.trim();
+  // いったん切断
+  if (familyRef) {
+    try {
+      familyRef.off();
+    } catch {}
+    familyRef = null;
+  }
+  firebaseReady = false;
+  lastSyncRaw = null;
+  if (!trimmed) {
+    try {
+      localStorage.removeItem(FAMILY_CODE_KEY);
+    } catch {}
+    toast("同期を オフにしました");
+    render();
+    return;
+  }
+  const isPublisher = window.confirm(
+    "この端末で 教材を 作りますか？\n\n" +
+      "「OK」   ＝ この端末(PC)で 作って 配信する\n" +
+      "「キャンセル」＝ 子の端末（受信だけ）"
+  );
+  try {
+    localStorage.setItem(FAMILY_CODE_KEY, trimmed);
+    localStorage.setItem(SYNC_ROLE_KEY, isPublisher ? "publisher" : "receiver");
+  } catch {}
+  toast(isPublisher ? "配信端末として つなぎます…" : "受信端末として つなぎます…");
+  initFirebaseSync().then(() => render());
 }
 
 function registerServiceWorker() {

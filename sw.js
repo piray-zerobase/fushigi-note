@@ -1,9 +1,10 @@
-const CACHE_NAME = "fushigi-note-v10";
+const CACHE_NAME = "fushigi-note-v11";
 const ASSETS = [
   "./",
   "./index.html",
   "./styles.css",
   "./app.js",
+  "./firebase-config.js",
   "./manifest.webmanifest",
   "./assets/icon.svg",
 ];

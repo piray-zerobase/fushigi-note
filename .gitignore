@@ -1,2 +1,5 @@
 *.bak
 .DS_Store
+
+# 設計メモ（個人用・公開しない）
+設計書_Firebase自動同期.md
