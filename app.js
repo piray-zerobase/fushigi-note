@@ -924,7 +924,11 @@ function renderThemes() {
             () => {
               store.selectedThemeId = theme.id;
               saveStore();
-              openTheme(theme);
+              // v3: テーマを選んだら クイズが主役の新ホームへ
+              // （ミッション一覧はホームの「🎨 おえかき・ミッション」から）
+              toast(`${theme.title} に きりかえたよ！`);
+              view = "home";
+              render();
             },
             [
               el("span", { className: "theme-icon", "aria-hidden": "true" }, theme.icon),
