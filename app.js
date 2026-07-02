@@ -1,5 +1,6 @@
 const STORAGE_KEY = "fushigi-note-v1";
 const CUSTOM_THEME_ID = "custom";
+const APP_VERSION = "3.0";
 
 // ============================================================
 // テーマ定義
@@ -240,8 +241,8 @@ let recordingTimerId = null;
 let recordingSeconds = 0;
 
 render();
-registerServiceWorker();
-initFirebaseSync();
+cleanupLegacyServiceWorker();
+initReceiveSync();
 
 // ============================================================
 // グローバルナビ
@@ -260,6 +261,11 @@ navButtons.forEach((button) => {
 backButton.addEventListener("click", () => {
   persistCanvas();
   stopSpeaking();
+  if (view === "quiz" || view === "stickers") {
+    view = "home";
+    render();
+    return;
+  }
   if (view === "mission") {
     view = "theme";
     activeMission = null;
@@ -335,6 +341,8 @@ function loadStore() {
           ? { pin: saved.parentMode.pin || null, unlocked: false }
           : { pin: null, unlocked: true },
         mailRecipients: Array.isArray(saved.mailRecipients) ? saved.mailRecipients : [],
+        quizDone: saved.quizDone && typeof saved.quizDone === "object" ? saved.quizDone : {},
+        stickers: Array.isArray(saved.stickers) ? saved.stickers : [],
       };
     }
   } catch (error) {
@@ -351,12 +359,30 @@ function loadStore() {
     starred: {},
     parentMode: { pin: null, unlocked: true },
     mailRecipients: [],
+    quizDone: {},
+    stickers: [],
   };
 }
 
+let saveErrorShown = false;
 function saveStore() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
-  schedulePublish();
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+    saveErrorShown = false;
+  } catch (error) {
+    // 容量オーバー等で保存できない時は、静かに失敗させず必ず知らせる
+    console.warn("保存に失敗", error);
+    if (!saveErrorShown) {
+      saveErrorShown = true;
+      alert(
+        "⚠️ ほぞんできませんでした！\n\n" +
+          "データが いっぱいの 可能性があります。\n" +
+          "「ずかん」から 古いカードを けすか、\n" +
+          "バックアップを 書き出してから りようを つづけてください。\n\n" +
+          "（このまま つかうと、とじた時に 内容が きえます）"
+      );
+    }
+  }
 }
 
 function normalizeCustomTheme(custom = {}) {
@@ -375,6 +401,9 @@ function normalizeCustomTheme(custom = {}) {
     reasonChoices: splitChoices(custom.reasonChoices, ["くらべたらわかった", "力があった", "まだふしぎ"]),
     homeFinds: splitChoices(custom.homeFinds, ["家の中", "外", "図鑑"]),
     missions: Array.isArray(custom.missions) ? custom.missions.map(normalizeMission) : undefined,
+    quizzes: Array.isArray(custom.quizzes)
+      ? custom.quizzes.map((z, i) => normalizeQuiz(z, i)).filter((z) => z.q && z.choices.length >= 2)
+      : undefined,
     deepDives: Array.isArray(custom.deepDives) ? custom.deepDives.map(normalizeDeepDive) : [],
     conversationSeeds: Array.isArray(custom.conversationSeeds)
       ? custom.conversationSeeds.filter(Boolean).slice(0, 8)
@@ -401,6 +430,43 @@ function normalizeDeepDive(d = {}) {
     prompt: d.prompt || "",
     link: d.link || "",
   };
+}
+
+// クイズ1件の正規化（v3の主役コンテンツ）
+// { q:出題文(読み上げ), choices:[{e:絵文字, t:短い文}], answer:正解番号,
+//   fun:正解後のひとこと解説(読み上げ), try:おうち実験への誘い(読み上げ) }
+function normalizeQuiz(qz = {}, idx = 0) {
+  const choices = Array.isArray(qz.choices)
+    ? qz.choices
+        .map((c) => (typeof c === "string" ? { e: "", t: c } : { e: c.e || "", t: c.t || "" }))
+        .filter((c) => c.e || c.t)
+        .slice(0, 3)
+    : [];
+  return {
+    id: qz.id || `qz-${idx}`,
+    q: qz.q || qz.question || "",
+    choices,
+    answer: typeof qz.answer === "number" ? qz.answer : 0,
+    fun: qz.fun || "",
+    try: qz.try || "",
+  };
+}
+
+// テーマからクイズ一覧を取り出す（新形式 quizzes ＞ 旧形式 quizミッション）
+function getQuizzesForTheme(theme) {
+  if (!theme) return [];
+  if (Array.isArray(theme.quizzes) && theme.quizzes.length) {
+    return theme.quizzes.map((z, i) => normalizeQuiz(z, i));
+  }
+  // 後方互換：既存テーマの quiz ミッションをクイズ化
+  return (theme.missions || [])
+    .filter((m) => m.type === "quiz" && Array.isArray(m.choices) && m.choices.length >= 2)
+    .map((m, i) =>
+      normalizeQuiz(
+        { id: m.id || `legacy-${i}`, q: m.prompt || m.title, choices: m.choices, answer: m.answer },
+        i
+      )
+    );
 }
 
 // ミッション1件の正規化
@@ -552,6 +618,8 @@ function render() {
   });
 
   if (view === "home") renderHome();
+  else if (view === "quiz") renderQuiz();
+  else if (view === "stickers") renderStickers();
   else if (view === "themes") renderThemes();
   else if (view === "theme") renderThemeDetail();
   else if (view === "mission") renderMission();
@@ -569,7 +637,67 @@ function render() {
 // ============================================================
 // ホーム
 // ============================================================
+// ============================================================
+// ホーム v3：「話しかけてくるクイズばんぐみ」
+// 読む場面ゼロ：でっかいクイズボタン＋絵のボタンだけ。
+// 文字は親向けの添え物（設計書v3 E1/E2）。
+// ============================================================
 function renderHome() {
+  const selectedTheme = getTheme(store.selectedThemeId);
+  const quizzes = getQuizzesForTheme(selectedTheme);
+  const doneCount = quizzes.filter((z) => store.quizDone[quizKey(selectedTheme, z)]).length;
+  const todayWonder = pickTodayWonder();
+
+  app.append(
+    el("section", { className: "view home-v3" }, [
+      // きょうのふしぎ（親が仕込んだ1問・読み上げ付き）
+      todayWonder
+        ? el("section", { className: "wonder-band" }, [
+            el("div", { className: "wonder-band__top" }, [
+              el("span", { className: "wonder-band__label" }, "✨ きょうの ふしぎ"),
+              speakButton(todayWonder.text),
+            ]),
+            el("p", { className: "wonder-band__text" }, todayWonder.text),
+          ])
+        : "",
+
+      // メイン：でっかいクイズスタート
+      el("section", { className: "quiz-hero" }, [
+        el("div", { className: "quiz-hero__icon" }, selectedTheme.icon),
+        el("p", { className: "quiz-hero__theme" }, selectedTheme.title),
+        button("", "quiz-start-button", startQuizShow, [
+          el("span", { className: "quiz-start-button__icon" }, "❓"),
+          el("span", { className: "quiz-start-button__label" }, "クイズ スタート！"),
+        ]),
+        quizzes.length
+          ? el("p", { className: "quiz-hero__progress" }, `${doneCount} / ${quizzes.length} せいかい`)
+          : el("p", { className: "quiz-hero__progress" }, "（クイズは おとなが ついかできます）"),
+      ]),
+
+      // サブ：絵で選ぶ3つの入り口
+      el("section", { className: "home-shortcuts" }, [
+        renderHomeShortcut("🎨", "おえかき・ミッション", () => openTheme(selectedTheme)),
+        renderHomeShortcut("📚", "じぶんの ずかん", () => {
+          view = "gallery";
+          render();
+        }),
+        renderHomeShortcut("⭐", `シール ${store.stickers.length}まい`, () => {
+          view = "stickers";
+          render();
+        }),
+      ]),
+    ])
+  );
+}
+
+function renderHomeShortcut(icon, label, onClick) {
+  return button("", "home-shortcut", onClick, [
+    el("span", { className: "home-shortcut__icon" }, icon),
+    el("span", { className: "home-shortcut__label" }, label),
+  ]);
+}
+
+function renderHomeLegacy() {
   const selectedTheme = getTheme(store.selectedThemeId);
   const recentCards = store.entries.slice(0, 3);
   const todayWonder = pickTodayWonder();
@@ -849,6 +977,243 @@ function renderThemeDetail() {
       ]),
     ])
   );
+}
+
+// ============================================================
+// クイズばんぐみ（v3 の主役体験）
+// 流れ：音声出題 → 絵をタップ → ピンポン🎉＋ひとこと解説 →
+//       「やってみる？」→ つぎ／おしまい → シール1まい →「見せよう」
+// ============================================================
+let quizState = null; // { theme, list, index, phase: "question"|"correct"|"try", locked:[], spokenKey }
+
+function quizKey(theme, quiz) {
+  return `${theme.id}::${quiz.id}`;
+}
+
+function startQuizShow() {
+  const theme = getTheme(store.selectedThemeId);
+  const all = getQuizzesForTheme(theme);
+  if (!all.length) {
+    speak("クイズが まだ ないよ。おとなの ひとに たのんでね");
+    toast("この テーマには クイズが まだ ありません");
+    return;
+  }
+  // 未正解を先に。全部正解済みなら最初から（何度でも遊べる）
+  const undone = all.filter((z) => !store.quizDone[quizKey(theme, z)]);
+  const list = undone.length ? undone : all;
+  quizState = { theme, list, index: 0, phase: "question", locked: [], spokenKey: "" };
+  view = "quiz";
+  render();
+}
+
+function currentQuiz() {
+  return quizState ? quizState.list[quizState.index] : null;
+}
+
+function speakOnceForPhase(text) {
+  // 同じ画面で再renderされても読み上げを繰り返さない
+  const key = `${quizState.index}:${quizState.phase}`;
+  if (quizState.spokenKey === key) return;
+  quizState.spokenKey = key;
+  window.setTimeout(() => speak(text), 250);
+}
+
+function renderQuiz() {
+  if (!quizState) {
+    view = "home";
+    render();
+    return;
+  }
+  const quiz = currentQuiz();
+  const { phase } = quizState;
+
+  if (phase === "question") {
+    speakOnceForPhase(quiz.q);
+    app.append(
+      el("section", { className: "view quiz-view" }, [
+        el("div", { className: "quiz-bubble" }, [
+          button("🔊", "quiz-replay", () => speak(quiz.q), [], { "aria-label": "もういちど きく" }),
+          el("p", { className: "quiz-bubble__text" }, quiz.q),
+        ]),
+        el(
+          "div",
+          { className: "quiz-choices" },
+          quiz.choices.map((choice, i) =>
+            button("", `quiz-choice ${quizState.locked.includes(i) ? "is-locked" : ""}`, () => answerQuiz(i), [
+              el("span", { className: "quiz-choice__emoji" }, choice.e || "❔"),
+              el("span", { className: "quiz-choice__text" }, choice.t),
+            ])
+          )
+        ),
+      ])
+    );
+    return;
+  }
+
+  if (phase === "correct") {
+    speakOnceForPhase(`ピンポーン！せいかい！${quiz.fun || ""}`);
+    app.append(
+      el("section", { className: "view quiz-view quiz-correct" }, [
+        renderConfetti(),
+        el("div", { className: "quiz-correct__badge" }, "🎉"),
+        el("h2", { className: "quiz-correct__title" }, "せいかい！"),
+        quiz.fun ? el("p", { className: "quiz-correct__fun" }, quiz.fun) : "",
+        el("div", { className: "quiz-actions" }, [
+          quiz.try
+            ? button("", "quiz-action-button", () => {
+                quizState.phase = "try";
+                render();
+              }, [
+                el("span", { className: "quiz-action-button__icon" }, "🧪"),
+                el("span", {}, "やってみる！"),
+              ])
+            : "",
+          button("", "quiz-action-button", nextQuiz, [
+            el("span", { className: "quiz-action-button__icon" }, "➡️"),
+            el("span", {}, "つぎの クイズ"),
+          ]),
+          button("", "quiz-action-button quiz-action-button--end", endQuizShow, [
+            el("span", { className: "quiz-action-button__icon" }, "🏁"),
+            el("span", {}, "おしまい"),
+          ]),
+        ]),
+      ])
+    );
+    return;
+  }
+
+  if (phase === "try") {
+    speakOnceForPhase(quiz.try);
+    app.append(
+      el("section", { className: "view quiz-view" }, [
+        el("div", { className: "quiz-bubble quiz-bubble--try" }, [
+          button("🔊", "quiz-replay", () => speak(quiz.try), [], { "aria-label": "もういちど きく" }),
+          el("p", { className: "quiz-bubble__text" }, `🧪 ${quiz.try}`),
+        ]),
+        el("p", { className: "hint quiz-try-hint" }, "できたら 「📚 ずかん」の ミッションで しゃしんや えに のこせるよ。"),
+        el("div", { className: "quiz-actions" }, [
+          button("", "quiz-action-button", nextQuiz, [
+            el("span", { className: "quiz-action-button__icon" }, "➡️"),
+            el("span", {}, "つぎの クイズ"),
+          ]),
+          button("", "quiz-action-button quiz-action-button--end", endQuizShow, [
+            el("span", { className: "quiz-action-button__icon" }, "🏁"),
+            el("span", {}, "おしまい"),
+          ]),
+        ]),
+      ])
+    );
+  }
+}
+
+function answerQuiz(choiceIndex) {
+  const quiz = currentQuiz();
+  if (!quiz || quizState.phase !== "question") return;
+  if (quizState.locked.includes(choiceIndex)) return;
+  if (choiceIndex === quiz.answer) {
+    playPinpon();
+    store.quizDone[quizKey(quizState.theme, quiz)] = true;
+    saveStore();
+    quizState.phase = "correct";
+    render();
+  } else {
+    playBubu();
+    quizState.locked.push(choiceIndex);
+    speak("おしい！ もういちど かんがえてみよう");
+    render();
+  }
+}
+
+function nextQuiz() {
+  stopSpeaking();
+  if (quizState.index + 1 < quizState.list.length) {
+    quizState.index += 1;
+    quizState.phase = "question";
+    quizState.locked = [];
+    render();
+  } else {
+    endQuizShow();
+  }
+}
+
+// おしまい → シールを1まい → 「見せよう」画面
+function endQuizShow() {
+  stopSpeaking();
+  const STICKER_SET = ["⭐", "🌟", "🌈", "🍀", "🏅", "💎", "🌸", "🚀"];
+  const icon = STICKER_SET[store.stickers.length % STICKER_SET.length];
+  store.stickers = [...store.stickers, { icon, date: new Date().toISOString() }];
+  saveStore();
+  quizState = null;
+  view = "stickers";
+  render();
+  window.setTimeout(() => speak(`シールが たまったよ！かあちゃんと たかちゃんに みせよう！`), 300);
+}
+
+function renderStickers() {
+  app.append(
+    el("section", { className: "view stickers-view" }, [
+      el("h2", { className: "stickers-title" }, "⭐ シールだいし ⭐"),
+      el("p", { className: "stickers-count" }, `${store.stickers.length} まい たまったよ！`),
+      el(
+        "div",
+        { className: "sticker-board" },
+        store.stickers.length
+          ? store.stickers.map((s) => el("span", { className: "sticker" }, s.icon))
+          : [el("p", { className: "hint" }, "クイズを おしまいまで やると シールが 1まい もらえるよ")]
+      ),
+      el("p", { className: "stickers-show" }, "できたね！ かあちゃん・たかちゃんに みせよう！"),
+      el("div", { className: "quiz-actions" }, [
+        button("", "quiz-action-button", () => {
+          view = "home";
+          render();
+        }, [
+          el("span", { className: "quiz-action-button__icon" }, "🏠"),
+          el("span", {}, "ホームへ"),
+        ]),
+      ]),
+    ])
+  );
+}
+
+// 紙吹雪（CSSアニメ・固定20枚）
+function renderConfetti() {
+  const COLORS = ["#f6b26b", "#93c47d", "#6fa8dc", "#e06666", "#ffd966", "#c27ba0"];
+  const pieces = [];
+  for (let i = 0; i < 20; i++) {
+    pieces.push(
+      el("span", {
+        className: "confetti-piece",
+        style: `left:${(i * 5 + 2) % 100}%; background:${COLORS[i % COLORS.length]}; animation-delay:${(i % 10) * 0.12}s;`,
+      })
+    );
+  }
+  return el("div", { className: "confetti", "aria-hidden": "true" }, pieces);
+}
+
+// ピンポン・ぶぶー（WebAudioで生成・音源ファイル不要）
+let audioCtx = null;
+function playTone(freq, duration, delay, type) {
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || "sine";
+    osc.frequency.value = freq;
+    const t0 = audioCtx.currentTime + (delay || 0);
+    gain.gain.setValueAtTime(0.25, t0);
+    gain.gain.exponentialRampToValueAtTime(0.001, t0 + duration);
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start(t0);
+    osc.stop(t0 + duration);
+  } catch {}
+}
+function playPinpon() {
+  playTone(784, 0.18, 0);
+  playTone(1319, 0.5, 0.18);
+}
+function playBubu() {
+  playTone(196, 0.22, 0, "square");
+  playTone(175, 0.35, 0.22, "square");
 }
 
 // ============================================================
@@ -1523,7 +1888,7 @@ function renderSettings() {
   app.append(
     el("section", { className: "view" }, [
       el("section", { className: "section-band" }, [
-        el("h2", {}, "おとな設定"),
+        el("h2", {}, `おとな設定（アプリ v${APP_VERSION}）`),
         el("p", { className: "hint" }, "きょうしつで ならったことを ベースに、テーマと ミッションを じゆうに 編集できます。"),
         el("div", { className: "settings-quick-grid" }, [
           renderSettingsQuickButton("💡", "アイデアばこ", `${ideasCount}件`, () => {
@@ -1540,7 +1905,10 @@ function renderSettings() {
           }),
           renderSettingsQuickButton("📧", "メール送り先", (store.mailRecipients || []).length ? `${store.mailRecipients.length}件` : "未設定", setMailRecipients),
           renderSettingsQuickButton("🔒", "PIN", store.parentMode?.pin ? "設定済み" : "未設定", setParentPin),
-          renderSettingsQuickButton("☁", "クラウド同期", syncStatusLabel(), openSyncSettings),
+          renderSettingsQuickButton("☁", "同期設定", syncStatusLabel(), openSyncSettings),
+          getSyncRole() === "publisher"
+            ? renderSettingsQuickButton("📤", "教材を配信", "クラウドへ送る", publishTeachingNow)
+            : "",
           renderSettingsQuickButton("🚪", "ロックして もどる", "", lockParentMode),
         ]),
         el("div", { className: "button-row" }, [
@@ -2098,9 +2466,7 @@ function renderIdeaPhotoBody(draft) {
         onchange: (e) => {
           const file = e.target.files?.[0];
           if (!file) return;
-          const reader = new FileReader();
-          reader.onload = () => { draft.photo = String(reader.result); render(); };
-          reader.readAsDataURL(file);
+          shrinkPhoto(file, (dataUrl) => { draft.photo = dataUrl; render(); });
         },
       }),
     ]),
@@ -2747,13 +3113,38 @@ function isMissionCompleted(themeId, missionId) {
 function handlePhoto(event) {
   const file = event.target.files?.[0];
   if (!file) return;
-
-  const reader = new FileReader();
-  reader.onload = () => {
-    draft.photo = String(reader.result);
+  shrinkPhoto(file, (dataUrl) => {
+    draft.photo = dataUrl;
     render();
+  });
+}
+
+// 写真を保存用に自動縮小（長辺1024px・JPEG）。
+// 生の写真(約3〜4MB)のままだと localStorage(上限約5MB)が
+// すぐ溢れて保存が全滅するため、必ずここを通す。
+function shrinkPhoto(file, onDone) {
+  const url = URL.createObjectURL(file);
+  const img = new Image();
+  img.onload = () => {
+    URL.revokeObjectURL(url);
+    const MAX = 1024;
+    const scale = Math.min(1, MAX / Math.max(img.width, img.height));
+    const w = Math.round(img.width * scale);
+    const h = Math.round(img.height * scale);
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+    onDone(canvas.toDataURL("image/jpeg", 0.8));
   };
-  reader.readAsDataURL(file);
+  img.onerror = () => {
+    URL.revokeObjectURL(url);
+    // 画像として読めない時は従来通り（安全側）
+    const reader = new FileReader();
+    reader.onload = () => onDone(String(reader.result));
+    reader.readAsDataURL(file);
+  };
+  img.src = url;
 }
 
 // ============================================================
@@ -3110,23 +3501,20 @@ function toast(message) {
 }
 
 // ============================================================
-// クラウド自動同期（Firebase Realtime Database）
+// クラウド同期 v2（Firebase Realtime Database・一方向・手動配信）
 // ------------------------------------------------------------
-// 設計（設計書_Firebase自動同期.md）:
-//   ・一方向：配信端末(PC)が教材を書き、受信端末(子)が受け取る。
-//   ・配信端末＝publish のみ／受信端末＝subscribe のみ（競合なし）。
-//   ・同期するのは「教材」だけ（selectedThemeId / customThemes /
-//     themeOverrides / dailyWonders）。子の成果(entries/starred/
-//     ideasBox/PIN)はFirebaseに乗せない・上書きしない。
-//   ・合言葉を SHA-256 したパスにだけ読み書き（鍵はコードに書かない）。
+// 設計（設計書_同期v2.md / 設計書v3_体験デザイン.md）:
+//   ・配信＝PCで「📤 教材を配信」を押した時だけ（自動では送らない）
+//   ・受信＝子の端末は開くだけで自動受信（ref.on）
+//   ・同期するのは教材だけ。子の成果(entries/starred/ideasBox/PIN)は
+//     クラウドに乗せない・上書きしない
+//   ・空データ・壊れたデータは受信しても適用しない（安全装置）
+//   ・役割(role)は端末に保存し、設定画面に常時表示する
 // ============================================================
 const FAMILY_CODE_KEY = "fushigi-family-code";
 const SYNC_ROLE_KEY = "fushigi-sync-role";
 let familyRef = null;
-let firebaseReady = false;
-let syncRole = "receiver";
-let lastSyncRaw = null;
-let pubTimer = null;
+let lastAppliedRaw = null;
 
 function firebaseConfigured() {
   const c = window.FUSHIGI_FIREBASE_CONFIG;
@@ -3150,9 +3538,9 @@ function getFamilyCode() {
 
 function getSyncRole() {
   try {
-    return localStorage.getItem(SYNC_ROLE_KEY) || "receiver";
+    return localStorage.getItem(SYNC_ROLE_KEY) || "";
   } catch {
-    return "receiver";
+    return "";
   }
 }
 
@@ -3175,49 +3563,43 @@ async function familyPath(code) {
     .slice(0, 40);
 }
 
-async function initFirebaseSync() {
-  if (!firebaseConfigured()) return; // 未設定 → 同期オフ（アプリは通常動作）
+async function connectFamilyRef() {
+  if (!firebaseConfigured()) throw new Error("firebase-config が未設定です");
   const code = getFamilyCode();
-  if (!code) return; // 合言葉未設定 → オフ
-  syncRole = getSyncRole();
+  if (!code) throw new Error("合言葉が未設定です");
+  if (!firebase.apps.length) firebase.initializeApp(window.FUSHIGI_FIREBASE_CONFIG);
+  await firebase.auth().signInAnonymously();
+  const path = await familyPath(code);
+  return firebase.database().ref("families/" + path + "/content");
+}
+
+// 受信端末：起動時に呼ばれ、クラウドの教材を待ち受ける
+async function initReceiveSync() {
+  if (getSyncRole() !== "receiver") return;
   try {
-    if (!firebase.apps.length) firebase.initializeApp(window.FUSHIGI_FIREBASE_CONFIG);
-    await firebase.auth().signInAnonymously();
-    const path = await familyPath(code);
-    if (familyRef) {
-      try {
-        familyRef.off();
-      } catch {}
-    }
-    familyRef = firebase.database().ref("families/" + path + "/content");
-    firebaseReady = true;
-    if (syncRole === "publisher") {
-      schedulePublish(); // 配信端末：今の教材をクラウドへ（初回シード）
-    } else {
-      familyRef.on("value", (snap) => onRemoteContent(snap.val())); // 受信端末：待ち受け
-    }
+    familyRef = await connectFamilyRef();
+    familyRef.on("value", (snap) => onRemoteContent(snap.val()));
   } catch (error) {
-    console.warn("Firebase同期に つながりませんでした", error);
-    firebaseReady = false;
+    console.warn("受信同期に つながりませんでした", error);
   }
 }
 
-// 受信端末：クラウドの教材を受け取って反映
 function onRemoteContent(raw) {
-  if (!raw || raw === lastSyncRaw) return;
-  lastSyncRaw = raw;
+  if (!raw || typeof raw !== "string" || raw === lastAppliedRaw) return;
   let data;
   try {
     data = JSON.parse(raw);
   } catch {
     return;
   }
-  if (applyTeaching(data)) render();
-}
-
-// 教材だけ置き換える（子の成果には触れない）
-function applyTeaching(data) {
-  if (!data || typeof data !== "object") return false;
+  // 安全装置：教材が空・形が不正なら適用しない（空で上書きして消す事故を防ぐ）
+  const hasContent =
+    data &&
+    typeof data === "object" &&
+    ((Array.isArray(data.customThemes) && data.customThemes.length > 0) ||
+      (Array.isArray(data.dailyWonders) && data.dailyWonders.length > 0));
+  if (!hasContent) return;
+  lastAppliedRaw = raw;
   if (Array.isArray(data.customThemes)) {
     store.customThemes = data.customThemes.map(normalizeCustomTheme);
   }
@@ -3230,83 +3612,100 @@ function applyTeaching(data) {
   if (data.selectedThemeId) {
     store.selectedThemeId = data.selectedThemeId;
   }
-  saveStore(); // 受信端末では schedulePublish は role 判定で何もしない
-  return true;
+  saveStore();
+  toast("あたらしい きょうざいが とどきました！");
+  render();
 }
 
-// 配信端末：教材が変わったらクラウドへ
-function schedulePublish() {
-  if (syncRole !== "publisher" || !firebaseReady || !familyRef) return;
-  clearTimeout(pubTimer);
-  pubTimer = window.setTimeout(() => {
-    const raw = JSON.stringify(teachingSubset(store));
-    if (raw === lastSyncRaw) return; // 教材に変化なし → 送らない
-    lastSyncRaw = raw;
-    familyRef.set(raw).catch((error) => console.warn("クラウドへの保存に 失敗", error));
-  }, 600);
+// 配信端末：ボタンを押した時だけクラウドへ送る
+async function publishTeachingNow() {
+  try {
+    toast("クラウドへ 送っています…");
+    if (!familyRef) familyRef = await connectFamilyRef();
+    await familyRef.set(JSON.stringify(teachingSubset(store)));
+    toast("✅ 配信しました！子の端末に とどきます");
+  } catch (error) {
+    console.warn("配信に失敗", error);
+    alert(
+      "配信できませんでした。\nネット接続と ☁同期設定を たしかめてください。\n\n" +
+        (error && error.message ? error.message : "")
+    );
+  }
 }
 
 function syncStatusLabel() {
   if (!firebaseConfigured()) return "未設定";
   if (!getFamilyCode()) return "合言葉 未設定";
-  const role = getSyncRole() === "publisher" ? "配信" : "受信";
-  return role + (firebaseReady ? "・ON" : "…");
+  const role = getSyncRole();
+  if (role === "publisher") return "配信端末";
+  if (role === "receiver") return "受信端末";
+  return "役割 未設定";
 }
 
 function openSyncSettings() {
   if (!firebaseConfigured()) {
-    alert(
-      "クラウド同期の じゅんびが まだです。\n\n" +
-        "Firebaseの せっていを firebase-config.js に はりつけてください。\n" +
-        "てじゅんは 設計書_Firebase自動同期.md の「7. 実装ステップ」を 見てね。"
-    );
+    alert("firebase-config.js が 未設定のため、同期は つかえません。");
     return;
   }
-  const curCode = getFamilyCode();
   const code = window.prompt(
-    "家族の あいことば を 入れてください。\n" +
-      "ぜんぶの 端末で 同じ ことばを 入れます。\n\n" +
-      "（れい: nagi-hikari-2026）\n\n" +
-      "空にして OK を おすと 同期を オフにします。",
-    curCode
+    "家族の あいことば（すべての端末で 同じことば）\n\n空にして OK → 同期オフ",
+    getFamilyCode()
   );
   if (code === null) return;
   const trimmed = code.trim();
-  // いったん切断
   if (familyRef) {
     try {
       familyRef.off();
     } catch {}
     familyRef = null;
   }
-  firebaseReady = false;
-  lastSyncRaw = null;
+  lastAppliedRaw = null;
   if (!trimmed) {
     try {
       localStorage.removeItem(FAMILY_CODE_KEY);
+      localStorage.removeItem(SYNC_ROLE_KEY);
     } catch {}
     toast("同期を オフにしました");
     render();
     return;
   }
-  const isPublisher = window.confirm(
-    "この端末で 教材を 作りますか？\n\n" +
-      "「OK」   ＝ この端末(PC)で 作って 配信する\n" +
-      "「キャンセル」＝ 子の端末（受信だけ）"
+  const cur = getSyncRole() === "publisher" ? "1" : "2";
+  const roleInput = window.prompt(
+    "この端末の やくわりを 数字で 入れてください。\n\n" +
+      " 1 ＝ 配信する端末（教材を作るPC）\n" +
+      " 2 ＝ 受信する端末（子のiPadなど）",
+    cur
   );
+  if (roleInput === null) return;
+  const role = roleInput.trim() === "1" ? "publisher" : "receiver";
   try {
     localStorage.setItem(FAMILY_CODE_KEY, trimmed);
-    localStorage.setItem(SYNC_ROLE_KEY, isPublisher ? "publisher" : "receiver");
+    localStorage.setItem(SYNC_ROLE_KEY, role);
   } catch {}
-  toast(isPublisher ? "配信端末として つなぎます…" : "受信端末として つなぎます…");
-  initFirebaseSync().then(() => render());
+  if (role === "receiver") {
+    toast("受信端末に なりました。自動で うけとります");
+    initReceiveSync().then(() => render());
+  } else {
+    toast("配信端末に なりました。「📤 教材を配信」で 送れます");
+    render();
+  }
 }
 
-function registerServiceWorker() {
-  if (!("serviceWorker" in navigator)) return;
-  window.addEventListener("load", () => {
-    navigator.serviceWorker.register("./sw.js").catch((error) => {
-      console.warn("Service worker registration failed", error);
-    });
-  });
+// ============================================================
+// 旧 Service Worker と キャッシュの完全撤去
+// （「古いコードが居座って更新が届かない」不具合の根絶。SWはもう使わない）
+// ============================================================
+async function cleanupLegacyServiceWorker() {
+  try {
+    if ("serviceWorker" in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map((r) => r.unregister()));
+    }
+    if (window.caches) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map((k) => caches.delete(k)));
+    }
+  } catch (error) {
+    console.warn("SW cleanup", error);
+  }
 }
