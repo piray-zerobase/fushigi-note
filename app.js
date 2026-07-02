@@ -3219,13 +3219,42 @@ function formatSeconds(sec) {
 // ============================================================
 // 音声読み上げ（Web Speech API）
 // ============================================================
+// 端末にある日本語音声の中から、いちばん自然なものを選ぶ。
+// 優先順位: Google 日本語(Chrome) > 拡張/プレミアム版 > Siri系 > その他 ja-JP
+let cachedJaVoice = null;
+function pickBestJaVoice() {
+  if (cachedJaVoice) return cachedJaVoice;
+  const voices = window.speechSynthesis.getVoices().filter((v) => (v.lang || "").startsWith("ja"));
+  if (!voices.length) return null;
+  const score = (v) => {
+    const n = (v.name || "").toLowerCase();
+    if (n.includes("google")) return 5;
+    if (n.includes("premium") || n.includes("enhanced") || n.includes("拡張")) return 4;
+    if (n.includes("siri")) return 3;
+    if (n.includes("kyoko") || n.includes("o-ren") || n.includes("hattori")) return 2;
+    return 1;
+  };
+  voices.sort((a, b) => score(b) - score(a));
+  cachedJaVoice = voices[0];
+  return cachedJaVoice;
+}
+// 音声リストは非同期に届くことがある（特にChrome）ので、届いたら選び直す
+if ("speechSynthesis" in window) {
+  window.speechSynthesis.onvoiceschanged = () => {
+    cachedJaVoice = null;
+    pickBestJaVoice();
+  };
+}
+
 function speak(text) {
   if (!("speechSynthesis" in window)) return;
   if (!text) return;
   window.speechSynthesis.cancel();
   const utter = new SpeechSynthesisUtterance(String(text));
   utter.lang = "ja-JP";
-  utter.rate = 0.85;
+  const voice = pickBestJaVoice();
+  if (voice) utter.voice = voice;
+  utter.rate = 0.95;
   utter.pitch = 1.05;
   utter.volume = 1.0;
   window.speechSynthesis.speak(utter);
